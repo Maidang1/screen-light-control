@@ -53,12 +53,13 @@ jobs:
           name: ScreenLight-windows
           path: dist
       - name: Publish GitHub Release
-        shell: powershell
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $assets = @(
             'dist/ScreenLight.exe',
             'dist/ScreenLight.exe.config',
