@@ -83,3 +83,18 @@ Get-Content -Encoding UTF8 .\diagnostics.txt
 - [WmiSetBrightness](https://learn.microsoft.com/en-us/windows/win32/wmicoreprov/wmisetbrightness-method-in-class-wmimonitorbrightnessmethods)
 - [GetVCPFeatureAndVCPFeatureReply](https://learn.microsoft.com/en-us/windows/win32/api/lowlevelmonitorconfigurationapi/nf-lowlevelmonitorconfigurationapi-getvcpfeatureandvcpfeaturereply)
 - [SetVCPFeature](https://learn.microsoft.com/en-us/windows/win32/api/lowlevelmonitorconfigurationapi/nf-lowlevelmonitorconfigurationapi-setvcpfeature)
+
+## GitHub Actions 自动构建与发布
+
+推送到 `main`、向 `main` 提交 PR，或在 Actions 页面手动运行 `Build and release Windows EXE`，都会在 Windows 上运行测试并构建。成功后可在该次运行的 Artifacts 中下载 `ScreenLight-windows`，产物保留 14 天。
+
+发布新版本时，创建并推送以 `v` 开头的版本标签，例如：
+
+```powershell
+git tag v3.0.0
+git push origin v3.0.0
+```
+
+标签工作流通过测试和构建后，会自动创建 GitHub Release 并上传 `ScreenLight.exe`、`ScreenLight.exe.config`、`ScreenLight-portable.zip`、第三方声明和 README。建议下载便携 ZIP，解压后直接运行；单独下载 EXE 时需同时下载配置文件并放在同一目录。重新运行同一标签的工作流会更新该 Release 的同名附件。
+
+发布使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需配置额外密钥。普通分支构建和手动运行仅生成 Artifacts，不创建 Release。
