@@ -12,6 +12,7 @@ namespace ScreenLight
         [STAThread]
         private static void Main(string[] args)
         {
+            if (HardwareWorker.TryRun(args)) return;
             if (args.Length == 2 && args[0] == "--diagnose")
             {
                 try
@@ -36,16 +37,16 @@ namespace ScreenLight
                 Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
                 if (!created)
                 {
+                    if (args.Contains("--tray")) return;
                     IntPtr window = FindWindow(null, "屏幕亮度 · Screen Light");
-                    if (window != IntPtr.Zero) { ShowWindow(window, 9); SetForegroundWindow(window); }
+                    if (window != IntPtr.Zero) { PostMessage(window, MainForm.ShowPanelMessage, IntPtr.Zero, IntPtr.Zero); }
                     else MessageBox.Show("程序正在启动，请稍候点击托盘中的紫色太阳图标。", "屏幕亮度");
                     return;
                 }
-                Application.Run(new MainForm());
+                Application.Run(new MainForm(false, true, args.Contains("--tray")));
             }
         }
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindow(string className, string title);
-        [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr window, int command);
-        [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
+        [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr window, int message, IntPtr wparam, IntPtr lparam);
     }
 }

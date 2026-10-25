@@ -31,7 +31,15 @@ namespace ScreenLight
         {
             try
             {
+                if (HardwareWorker.TryRun(args)) return 0;
+                if (args.Length == 2 && args[0] == "--test-no-connect") System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
+                if (args.Length == 2 && args[0] == "--test-hardware-worker") return TestHardwareWorker(args[1]);
+                TransportTests();
+                ExtendedControlTests();
+                if (args.Contains("--transport-only")) { Console.WriteLine("PASS: " + checks + " control and transport checks."); return 0; }
                 Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+                if (args.Contains("--tray-ui-only")) { TrayTests(); Console.WriteLine("PASS: tray window lifecycle; " + checks + " checks"); return 0; }
+                if (args.Contains("--console-ui-only")) { ConsoleUiTest("/tmp"); return 0; }
                 Equal(20u, BrightnessMath.ToRaw(0, 20, 220), "nonzero minimum");
                 Equal(120u, BrightnessMath.ToRaw(50, 20, 220), "scaled midpoint");
                 Equal(220u, BrightnessMath.ToRaw(150, 20, 220), "clamped maximum");
@@ -70,10 +78,12 @@ namespace ScreenLight
                     slider.Minimum = 10; slider.Value = 0; Equal(10, slider.Value, "software minimum");
                 }
                 string output = args.Length > 0 ? args[0] : "test-output"; Directory.CreateDirectory(output);
+                ConsoleUiTest(output);
+                TrayTests();
                 SettingsTests(output);
                 SettingsUiTests(output);
                 System.Threading.SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
-                var asyncChecks = ControlTests();
+                var asyncChecks = AllControlTests();
                 var deadline = DateTime.UtcNow.AddSeconds(20);
                 while (!asyncChecks.IsCompleted && DateTime.UtcNow < deadline) { Application.DoEvents(); System.Threading.Thread.Sleep(5); }
                 Equal(true, asyncChecks.IsCompleted, "async controls finish without deadlock");
@@ -92,6 +102,256 @@ namespace ScreenLight
                 return 0;
             }
             catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
+        }
+        private static int TestHardwareWorker(string pipeName)
+        {
+            using (var pipe = new System.IO.Pipes.NamedPipeClientStream(".", pipeName, System.IO.Pipes.PipeDirection.InOut))
+            {
+                pipe.Connect(3000);
+                using (var input = new StreamReader(pipe))
+                using (var output = new StreamWriter(pipe) { AutoFlush = true })
+                {
+                    string command; bool hangWrites = false; string recoveryFile = null;
+                    while ((command = input.ReadLine()) != null)
+                    {
+                        if (command.StartsWith("RECOVERY ")) recoveryFile = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(command.Substring(9)));
+                        if (command == "ARM") hangWrites = true;
+                        if (hangWrites && command.StartsWith("WRITE ")) System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
+                        if (command == "HANG") System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
+                        if (command == "EXIT") return 0;
+                        if (command == "ERROR") output.WriteLine("ERROR " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("simulated API failure")));
+                        else if (command == "PID") output.WriteLine(System.Diagnostics.Process.GetCurrentProcess().Id);
+                        else if (command.StartsWith("DISCOVER "))
+                        {
+                            string screen = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(command.Substring(9)));
+                            if (screen == "bad") System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
+                            using (var service = new NativeMonitorService())
+                            {
+                                var device = Device(new FakeChannel { Name = "test hardware" });
+                                device.ScreenName = screen; device.Instance = screen;
+                                service.Devices.Add(device);
+                                output.WriteLine(HardwareWorker.Snapshot(service));
+                            }
+                        }
+                        else if (command.StartsWith("READ ")) output.WriteLine("65");
+                        else output.WriteLine("OK");
+
+                    }
+                    if (recoveryFile != null) File.WriteAllText(recoveryFile, "restored");
+                    return 0;
+                }
+            }
+        }
+        private static System.Diagnostics.ProcessStartInfo WorkerStart(string arguments = "--test-hardware-worker")
+        {
+            string executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            if (Type.GetType("Mono.Runtime") != null)
+                return new System.Diagnostics.ProcessStartInfo(System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName,
+                    "\"" + executable + "\" " + arguments);
+            return new System.Diagnostics.ProcessStartInfo(executable, arguments);
+        }
+        private static void TransportTests()
+        {
+            string recoveryFile = Path.Combine(Path.GetTempPath(), "screen-light-recovery-" + Guid.NewGuid().ToString("N") + ".txt");
+            try
+            {
+                using (var connection = new HardwareConnection(WorkerStart(), true))
+                {
+                    int pid = int.Parse(connection.Request("PID", 3000));
+                    connection.Request("RECOVERY " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(recoveryFile)), 3000);
+                    using (var child = System.Diagnostics.Process.GetProcessById(pid))
+                    {
+                        connection.Dispose();
+                        bool exited = child.WaitForExit(3000);
+                        if (!exited) child.Kill();
+                        Equal(true, exited, "trial worker is allowed to finish recovery after disconnection");
+                        Equal("restored", File.ReadAllText(recoveryFile), "trial connection disposal preserves recovery responsibility");
+                    }
+                }
+            }
+            finally { if (File.Exists(recoveryFile)) File.Delete(recoveryFile); }
+            using (var service = new MonitorService(() => new HardwareConnection(WorkerStart()),
+                () => new[] { new MonitorDevice { ScreenName = "bad" }, new MonitorDevice { ScreenName = "good" } }, 3000))
+            {
+                service.Discover();
+                Equal(2, service.Devices.Count, "discovery retains both screens after one worker hangs");
+                Equal(true, service.Devices[0].UsingSoftware, "hung screen uses logical screen fallback");
+                Equal(true, service.Devices[1].Supported, "healthy screen retains hardware channels");
+                service.Devices[1].Wait = delegate { };
+                service.Devices[1].Set(65);
+                Equal(65, service.Devices[1].HardwareValue, "healthy screen remains controllable after another worker times out");
+            }
+            using (var stuck = new HardwareConnection(WorkerStart()))
+            using (var healthy = new HardwareConnection(WorkerStart()))
+            {
+                Equal("OK", healthy.Request("PING", 3000), "second screen worker started");
+                bool failed = false;
+                try { stuck.Request("HANG", 200); } catch (TimeoutException) { failed = true; }
+                Equal(true, failed, "one screen worker times out");
+                Equal(65, new RemoteChannel(healthy, 0, 0, "healthy screen").Read(), "one screen timeout leaves another screen worker alive");
+            }
+            using (var connection = new HardwareConnection(WorkerStart("--hardware-worker " + System.Diagnostics.Process.GetCurrentProcess().Id)))
+            {
+                for (int i = 0; i < 2; i++)
+                {
+                    bool failed = false;
+                    try { connection.Request("INVALID", 3000); } catch (InvalidOperationException) { failed = true; }
+                    Equal(true, failed, "real worker dispatch and parent watchdog stay alive");
+                }
+            }
+            using (var connection = new HardwareConnection(WorkerStart("--test-no-connect")))
+            {
+                bool failed = false; var watch = System.Diagnostics.Stopwatch.StartNew();
+                try { connection.Request("PING", 200); } catch (TimeoutException) { failed = true; }
+                Equal(true, failed, "worker startup also has a deadline");
+                Equal(true, watch.ElapsedMilliseconds < 5000, "startup timeout returns promptly");
+            }
+            using (var connection = new HardwareConnection(WorkerStart()))
+            {
+                Equal("OK", connection.Request("PING", 3000), "worker responds");
+                bool failed = false;
+                try { connection.Request("ERROR", 3000); } catch (InvalidOperationException) { failed = true; }
+                Equal(true, failed, "API failure propagated");
+                Equal("OK", connection.Request("PING", 3000), "API failure permits another channel");
+                var channel = new RemoteChannel(connection, 0, 0, "test proxy");
+                channel.Write(65); Equal(65, channel.Read(), "remote read and write protocol");
+                int pid = int.Parse(connection.Request("PID", 3000));
+                using (var child = System.Diagnostics.Process.GetProcessById(pid))
+                {
+                    var watch = System.Diagnostics.Stopwatch.StartNew(); failed = false;
+                    try { connection.Request("HANG", 200); } catch (TimeoutException) { failed = true; }
+                    Equal(true, failed, "hung hardware has a deadline");
+                    Equal(true, watch.ElapsedMilliseconds < 5000, "timeout returns promptly");
+                    Equal(true, child.WaitForExit(3000), "hung worker is terminated");
+                }
+                failed = false;
+                try { connection.Request("PING", 3000); } catch (IOException) { failed = true; }
+                Equal(true, failed, "timed out worker is never reused");
+                connection.Dispose(); // cleanup must be idempotent after timeout
+            }
+            using (var connection = new HardwareConnection(WorkerStart()))
+            {
+                bool failed = false;
+                try { connection.Request("EXIT", 3000); } catch (IOException) { failed = true; }
+                Equal(true, failed, "unexpected worker exit cannot hang caller");
+            }
+            using (var connection = new HardwareConnection(WorkerStart()))
+                Equal("OK", connection.Request("PING", 3000), "fresh worker recovers after failure");
+            using (var connection = new HardwareConnection(WorkerStart()))
+            using (var device = Device(new RemoteChannel(connection, 0, 0, "hung channel", 200), new RemoteChannel(connection, 0, 1, "second channel", 200)))
+            {
+                connection.Request("ARM", 3000);
+                bool failed = false; var watch = System.Diagnostics.Stopwatch.StartNew();
+                try { device.Set(45); } catch (InvalidOperationException) { failed = true; }
+                Equal(true, failed, "hung write reaches existing software fallback path");
+                Equal(70, device.HardwareValue, "timed out write is never reported as verified");
+                Equal(2, device.Attempts.Count, "remaining channel fails safely after timeout");
+                Equal(true, watch.ElapsedMilliseconds < 5000, "channel retries cannot keep lock forever");
+            }
+        }
+        private static DesktopState SampleDesktop()
+        {
+            var result = new DesktopState();
+            for (int i = 0; i < 2; i++) result.Screens.Add(new DesktopScreen { Id = "stable-" + i, Name = "测试显示器 " + i, Device = "DISPLAY" + i,
+                Width = 1920, Height = 1080, Frequency = 60, X = i * 1920, Primary = i == 0,
+                Modes = new System.Collections.Generic.List<DesktopMode> { new DesktopMode { Width = 1920, Height = 1080, Frequency = 60 } } });
+            return result;
+        }
+        private static void ExtendedControlTests()
+        {
+            Equal(220, Marshal.SizeOf(typeof(WindowsDesktop.DevMode)), "DEVMODE ABI for mode enumeration");
+            var state = SampleDesktop();
+            Func<DesktopPlan> plan = () => new DesktopPlan { Screens = WireXml.Unpack<DesktopState>(WireXml.Pack(state)).Screens };
+            plan().Validate(state); Equal(2, plan().Screens.Count, "display plan roundtrip");
+            Action<DesktopPlan, string> reject = (value, name) => {
+                bool failed = false; try { value.Validate(state); } catch (InvalidDataException) { failed = true; }
+                Equal(true, failed, name);
+            };
+            var edit = plan(); edit.Screens[0].Primary = false; reject(edit, "missing primary rejected");
+            edit = plan(); edit.Screens[1].Primary = true; reject(edit, "multiple primary rejected");
+            edit = plan(); edit.Screens[1].Id = "missing"; reject(edit, "disconnected profile rejected");
+            edit = plan(); edit.Screens[1].Id = edit.Screens[0].Id; reject(edit, "duplicate monitor rejected");
+            edit = plan(); edit.Screens[1].X = 100; reject(edit, "overlapping layout rejected");
+            edit = plan(); edit.Screens[1].X = 5000; reject(edit, "unreachable desktop island rejected");
+            edit = plan(); edit.Screens[0].Frequency = 144; reject(edit, "unsupported refresh rejected");
+            edit = plan(); edit.Screens[0].HdrEnabled = true; reject(edit, "unavailable HDR rejected");
+            edit = plan(); edit.Screens[0].Rotation = 45; reject(edit, "arbitrary rotation rejected");
+            edit = plan(); edit.Screens[0].X = int.MinValue; reject(edit, "coordinate overflow rejected");
+            edit = plan(); edit.Topology = 2; reject(edit, "mixed topology and screen edits rejected");
+            reject(new DesktopPlan { Topology = 3 }, "invalid projection rejected");
+            foreach (int topology in new[] { 1, 2, 4, 8 }) { new DesktopPlan { Topology = topology }.Validate(state); Equal(true, true, "standard projection accepted"); }
+            edit = plan(); edit.Screens[1].Rotation = 90; edit.Screens[1].Width = 1080; edit.Screens[1].Height = 1920;
+            edit.Validate(state); Equal(90, edit.Screens[1].Rotation, "rotation validates against native orientation modes");
+            var now = new DateTime(2026, 1, 1); int restores = 0, saves = 0;
+            var trial = new DesktopTrial(() => restores++, () => saves++, () => now);
+            string token = trial.Begin(); now = now.AddSeconds(19); trial.Tick(); Equal(0, restores, "trial lasts until deadline");
+            now = now.AddSeconds(1); trial.Tick(); Equal(1, restores, "deadline restores original snapshot");
+            trial.Tick(); Equal(1, restores, "recovery is idempotent");
+            bool failedToken = false; try { trial.Confirm(token); } catch (InvalidOperationException) { failedToken = true; }
+            Equal(true, failedToken, "late confirmation cannot persist reverted settings");
+            token = trial.Begin(); trial.Confirm(token); Equal(1, saves, "confirmation persists current configuration");
+            now = now.AddMinutes(1); trial.Tick(); Equal(1, restores, "confirmed settings do not revert");
+            token = trial.Begin(); now = now.AddSeconds(20);
+            failedToken = false; try { trial.Confirm(token); } catch (InvalidOperationException) { failedToken = true; }
+            Equal(true, failedToken, "deadline checked during confirmation even before timer ticks");
+            Equal(2, restores, "late confirmation restores immediately");
+            trial.Begin(); trial.Revert(); Equal(3, restores, "disconnect or explicit cancel restores pending trial");
+            int attempts = 0;
+            var retry = new DesktopTrial(() => { if (++attempts == 1) throw new IOException("device not ready"); }, () => { }, () => now);
+            retry.Begin(); now = now.AddSeconds(21);
+            try { retry.Tick(); } catch (IOException) { }
+            Equal(true, retry.Token != null, "failed recovery keeps snapshot pending"); retry.Tick(); Equal(2, attempts, "recovery retries after transient driver error");
+            var badSave = new DesktopTrial(() => { }, () => { throw new IOException("save failed"); }, () => now);
+            token = badSave.Begin(); try { badSave.Confirm(token); } catch (IOException) { }
+            Equal(true, badSave.Token != null, "persist failure keeps rollback armed");
+            bool xmlRejected = false;
+            try { WireXml.Unpack<DesktopPlan>(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("<!DOCTYPE x [<!ENTITY e SYSTEM 'file:///nonexistent'>]><DesktopPlan>&e;</DesktopPlan>"))); }
+            catch (InvalidOperationException) { xmlRejected = true; }
+            Equal(true, xmlRejected, "profile parser prohibits external entities");
+        }
+        private static void ConsoleUiTest(string output)
+        {
+            using (var form = new DisplayConsoleForm(false))
+            {
+                form.LoadState(SampleDesktop()); form.Show(); Application.DoEvents();
+                using (var bitmap = new Bitmap(form.Width, form.Height))
+                {
+                    using (var graphics = Graphics.FromImage(bitmap)) graphics.CopyFromScreen(form.Location, Point.Empty, form.Size);
+                    bitmap.Save(Path.Combine(output, "screen-light-console.png"));
+                }
+                Equal(true, form.Controls.OfType<TabControl>().Single().TabPages.Count == 4, "display console exposes all capability groups");
+                form.Close();
+                for (int i = 0; i < 100 && !form.IsDisposed; i++) { Application.DoEvents(); System.Threading.Thread.Sleep(5); }
+                Equal(true, form.IsDisposed, "console can close without touching display hardware");
+                Console.WriteLine("PASS: display console renders and closes without native display writes; " + checks + " checks");
+            }
+        }
+        private static void TrayTests()
+        {
+            using (var form = new MainForm(true, false, true))
+            {
+                form.Show(); Application.DoEvents();
+                Equal(false, form.Visible, "tray launch never displays the main window");
+                Equal(true, form.IsHandleCreated, "tray launch keeps a hidden window for hotkeys");
+                IntPtr originalWindow = form.Handle;
+                form.Restore(); Application.DoEvents();
+                Equal(true, form.Visible, "tray activation opens hidden panel");
+                Equal(originalWindow, form.Handle, "opening tray panel preserves hotkey window");
+                if (Type.GetType("Mono.Runtime") == null)
+                {
+                    form.WindowState = FormWindowState.Minimized; Application.DoEvents();
+                    Equal(false, form.Visible, "minimize hides panel into tray");
+                    Equal(originalWindow, form.Handle, "minimize preserves hotkey registrations");
+                }
+                else form.Hide(); // Xvfb without a window manager cannot generate Windows minimize events.
+                form.Restore(); Application.DoEvents();
+                Equal(FormWindowState.Normal, form.WindowState, "tray activation restores normal state before showing");
+                Equal(true, form.Visible, "minimized panel can reopen from tray");
+                var exit = form.ExitAsync();
+                for (int i = 0; i < 200 && !exit.IsCompleted; i++) { Application.DoEvents(); System.Threading.Thread.Sleep(5); }
+                Equal(true, exit.IsCompleted, "tray exit completes cleanup"); exit.GetAwaiter().GetResult();
+                Equal(true, form.IsDisposed, "tray exit disposes main window");
+            }
         }
         private static void SettingsTests(string output)
         {
@@ -202,6 +462,8 @@ namespace ScreenLight
                 }
             }
         }
+        private static async Task AllControlTests()
+        { await ControlTests(); await HungHardwareUiTest(); }
         private static async Task ControlTests()
         {
             using (var form = new MainForm(true))
@@ -246,6 +508,29 @@ namespace ScreenLight
                 Equal(true, failed.UsingSoftware, "hybrid still falls back when hardware ignores writes");
                 Equal(70, failed.HardwareValue, "fallback retains actual backlight"); Equal(15, failed.Value, "fallback uses requested software percentage");
                 form.ResetDimming(); await form.ExitAsync();
+            }
+        }
+        private static async Task HungHardwareUiTest()
+        {
+            using (var connection = new HardwareConnection(WorkerStart()))
+            using (var form = new MainForm(true, false))
+            using (var device = Device(new RemoteChannel(connection, 0, 0, "hung driver", 1500)))
+            using (var healthy = Device(new FakeChannel { Name = "independent healthy driver" }))
+            {
+                connection.Request("ARM", 3000);
+                device.Bounds = new Rectangle(-12000, -12000, 30, 30);
+                healthy.ScreenName = "healthy-screen"; healthy.Bounds = new Rectangle(-12100, -12000, 30, 30);
+                form.AttachDevice(device); form.AttachDevice(healthy); form.preferences.Smooth = false;
+                form.SetAll(45); var work = form.ApplyPending();
+                for (int i = 0; i < 20 && healthy.HardwareValue != 45; i++) await Task.Delay(20);
+                Equal(45, healthy.HardwareValue, "healthy screen writes while another screen is still blocked");
+                Equal(false, work.IsCompleted, "healthy write does not wait for the hung screen deadline");
+                await work;
+                Equal(true, form.IsIdle, "UI releases I/O lock after hung driver");
+                Equal(true, device.UsingSoftware, "hung driver falls back to software dimming");
+                Equal(45, device.Value, "software target applied after hardware timeout");
+                form.ResetDimming(); await form.ExitAsync();
+                Equal(true, form.IsDisposed, "exit completes after driver timeout");
             }
         }
         private static int Integration(string output)
