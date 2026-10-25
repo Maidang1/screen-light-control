@@ -20,17 +20,19 @@ namespace ScreenLight
         internal readonly List<MonitorCard> Cards = new List<MonitorCard>();
         private readonly Panel list;
         private readonly Label emptyState;
-        private readonly UiButton refresh, reset, details, settingsButton;
+        private readonly UiButton refresh, reset, details, settingsButton, consoleButton;
         internal readonly ToggleSwitch LinkSwitch;
         private readonly SettingsStore settingsStore;
         internal AppSettings preferences;
         private readonly bool testing;
         private string hotkeyStatus;
-        private bool linkedUpdate, firstDiscovery = true, settingsOpen;
+        private bool linkedUpdate, firstDiscovery = true, settingsOpen, startHidden, initialized;
+        private Form activeDialog;
+        internal const int ShowPanelMessage = 0x8001;
         private int operationVersion;
         private readonly List<UiButton> presets = new List<UiButton>();
         private readonly NotifyIcon tray;
-        private readonly System.Windows.Forms.Timer debounce;
+        private readonly System.Windows.Forms.Timer debounce, topologyDebounce;
         private readonly Icon appIcon;
         internal readonly float UiScale;
         private bool refreshing, writing, exiting, allowClose, refreshAgain, resourcesDisposed;
@@ -40,9 +42,9 @@ namespace ScreenLight
         internal IntPtr[] DimmingHandles { get { return dimming.Handles; } }
 
         internal MainForm() : this(false) { }
-        internal MainForm(bool testMode, bool discoverOnShow = true)
+        internal MainForm(bool testMode, bool discoverOnShow = true, bool startInTray = false)
         {
-            testing = testMode;
+            testing = testMode; startHidden = startInTray;
             settingsStore = new SettingsStore(testMode ? null : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.xml"));
             preferences = settingsStore.Load();
             Text = "屏幕亮度 · Screen Light"; BackColor = Theme.Background; ForeColor = Theme.Text; AutoScaleMode = AutoScaleMode.None;
@@ -54,6 +56,8 @@ namespace ScreenLight
             reset = Button("恢复画面", delegate { ResetDimming(); });
             details = Button("诊断详情", delegate { ShowDiagnostics(); });
             settingsButton = Button("设置", delegate { ShowSettings(); });
+            consoleButton = Button("显示控制台", delegate { ShowDisplayConsole(); });
+            consoleButton.Link = true;
             settingsButton.Link = true; details.Link = true;
             details.MutedLink = true;
             LinkSwitch = new ToggleSwitch { Text = "滑块联动", UiScale = UiScale, BackColor = Theme.Background, Checked = preferences.Linked, AccessibleName = "所有屏幕滑块联动" };
@@ -69,23 +73,51 @@ namespace ScreenLight
             }
             var menu = new ContextMenuStrip(); menu.Items.Add("打开亮度面板", null, delegate { Restore(); });
             menu.Items.Add("设置 / 快捷键", null, delegate { ShowSettings(); });
+            menu.Items.Add("显示控制台", null, delegate { ShowDisplayConsole(); });
+            var brightnessMenu = new ToolStripMenuItem("亮度预设");
+            for (int i = 0; i < values.Length; i++)
+            {
+                int target = values[i]; brightnessMenu.DropDownItems.Add(names[i] + " · " + target + "%", null, delegate { SetAll(target); });
+            }
+            menu.Items.Add(brightnessMenu);
+            menu.Items.Add("重新检测显示器", null, async delegate { await RefreshDevices(); });
             menu.Items.Add("恢复画面（清除软件调光）", null, delegate { ResetDimming(); }); menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出", null, async delegate { await ExitAsync(); });
-            tray = new NotifyIcon { Icon = appIcon, Text = "Screen Light · 屏幕亮度", ContextMenuStrip = menu, Visible = !testMode };
+            tray = new NotifyIcon { Icon = appIcon, Text = "Screen Light · 显示控制", ContextMenuStrip = menu, Visible = !testMode };
             tray.MouseClick += delegate(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Restore(); };
             debounce = new System.Windows.Forms.Timer { Interval = 90 };
             debounce.Tick += async delegate { debounce.Stop(); await ApplyPending(); };
-            Shown += async delegate { ConfigureHotkeys(); if (discoverOnShow) await RefreshDevices(); };
-            Resize += delegate { LayoutUi(); };
+            topologyDebounce = new System.Windows.Forms.Timer { Interval = 200 };
+            topologyDebounce.Tick += async delegate { topologyDebounce.Stop(); await RefreshDevices(); };
+            Shown += async delegate { await InitializeAsync(discoverOnShow); };
+            Resize += delegate { LayoutUi(); if (WindowState == FormWindowState.Minimized) HideToTray(); };
             FormClosing += async delegate(object sender, FormClosingEventArgs e)
             {
                 if (allowClose) return;
                 if (e.CloseReason == CloseReason.WindowsShutDown || e.CloseReason == CloseReason.TaskManagerClosing)
-                { exiting = true; pending.Clear(); debounce.Stop(); dimming.Dispose(); tray.Visible = false; allowClose = true; return; }
+                { exiting = true; pending.Clear(); debounce.Stop(); topologyDebounce.Stop(); dimming.Dispose(); tray.Visible = false; allowClose = true; return; }
                 e.Cancel = true;
-                if (testMode) await ExitAsync(); else Hide();
+                if (testMode) await ExitAsync(); else HideToTray();
             };
             LayoutUi(); UpdateButtons();
+            if (startHidden)
+            {
+                // Create the hidden message window for hotkeys and tray activation without flashing a form.
+                var window = Handle;
+                BeginInvoke(new Action(async delegate { await InitializeAsync(discoverOnShow); }));
+            }
+        }
+        private async Task InitializeAsync(bool discover)
+        {
+            if (initialized || exiting) return;
+            initialized = true; ConfigureHotkeys(); if (discover) await RefreshDevices();
+        }
+        protected override void SetVisibleCore(bool value) { base.SetVisibleCore(value && !startHidden); }
+        private void HideToTray()
+        {
+            // Hidden forms have no taskbar button. Keep ShowInTaskbar unchanged so WinForms
+            // does not recreate the HWND and invalidate global hotkey registrations.
+            Hide();
         }
         private int S(float value) { return (int)Math.Round(value * UiScale); }
         private UiButton Button(string text, Action click)
@@ -108,6 +140,7 @@ namespace ScreenLight
             reset.SetBounds(S(w - 132), S(h - 96), S(100), S(36));
             settingsButton.SetBounds(S(24), S(h - 96), S(50), S(36));
             details.SetBounds(S(80), S(h - 96), S(80), S(36));
+            consoleButton.SetBounds(S(168), S(h - 96), S(100), S(36));
             Invalidate();
         }
         protected override void OnPaint(PaintEventArgs e)
@@ -122,7 +155,18 @@ namespace ScreenLight
             using (var pen = new Pen(Theme.Border)) g.DrawLine(pen, 32, h - 117, w - 32, h - 117);
             Theme.TextAt(g, "关闭后驻留托盘  ·  Ctrl + Alt + ↑ / ↓ 调节亮度", 11, Theme.Muted, new RectangleF(32, h - 40, w - 64, 24));
         }
-        private void Restore() { if (exiting) return; Show(); WindowState = FormWindowState.Normal; Activate(); }
+        internal void Restore()
+        {
+            if (exiting) return;
+            if (activeDialog != null && !activeDialog.IsDisposed) { activeDialog.WindowState = FormWindowState.Normal; activeDialog.Activate(); return; }
+            startHidden = false; WindowState = FormWindowState.Normal; Show(); Activate();
+        }
+        private DialogResult ShowOwnedDialog(Form dialog)
+        {
+            activeDialog = dialog;
+            try { return dialog.ShowDialog(this); }
+            finally { activeDialog = null; }
+        }
         private void Remember(MonitorDevice device)
         {
             device.Settings.LastValue = device.Value;
@@ -144,7 +188,7 @@ namespace ScreenLight
                 dialog.Icon = Icon;
                 DialogResult result;
                 settingsOpen = true;
-                try { result = dialog.ShowDialog(this); }
+                try { result = ShowOwnedDialog(dialog); }
                 finally { settingsOpen = false; }
                 if (result != DialogResult.OK) return;
                 if (!settingsStore.Save(dialog.Value)) { MessageBox.Show(this, settingsStore.Error, "无法保存设置"); return; }
@@ -171,6 +215,21 @@ namespace ScreenLight
                 }
                 SaveSettings(); ConfigureHotkeys(); await RefreshDevices();
             }
+        }
+        private async void ShowDisplayConsole()
+        {
+            if (writing || refreshing || exiting || settingsOpen) return;
+            await ApplyPending(); if (writing || refreshing || exiting) return;
+            settingsOpen = true;
+            // Do not retain brightness-worker handles across system mode changes.
+            dimming.Dispose();
+            try
+            {
+                await Task.Run(() => service.Dispose());
+                if (!exiting) using (var dialog = new DisplayConsoleForm()) { dialog.Icon = Icon; ShowOwnedDialog(dialog); }
+            }
+            finally { settingsOpen = false; }
+            if (!exiting) await RefreshDevices();
         }
         private void ConfigureHotkeys()
         {
@@ -213,13 +272,15 @@ namespace ScreenLight
         protected override void WndProc(ref Message message)
         {
             base.WndProc(ref message);
+            if (message.Msg == ShowPanelMessage) { Restore(); return; }
             if (message.Msg == 0x0312 && preferences != null && !exiting) HandleHotkey(message.WParam.ToInt32());
-            if (message.Msg == 0x007E && list != null && !exiting && IsHandleCreated)
+            bool displayChanged = message.Msg == 0x007E || (message.Msg == 0x0218 && (message.WParam.ToInt32() == 7 || message.WParam.ToInt32() == 18));
+            if (displayChanged && topologyDebounce != null && list != null && !exiting && IsHandleCreated)
             {
                 operationVersion++;
                 // Remove obsolete overlay rectangles immediately when monitor topology changes.
-                dimming.Dispose();
-                BeginInvoke(new Action(async delegate { await RefreshDevices(); }));
+                dimming.Dispose(); pending.Clear(); debounce.Stop();
+                topologyDebounce.Stop(); topologyDebounce.Start();
             }
         }
         private void UpdateButtons()
@@ -227,14 +288,17 @@ namespace ScreenLight
             emptyState.Visible = Cards.Count == 0; emptyState.Text = Status;
             refresh.Enabled = !refreshing && !writing && !exiting; reset.Enabled = !refreshing && !exiting;
             settingsButton.Enabled = !refreshing && !writing && !exiting;
+            consoleButton.Enabled = settingsButton.Enabled;
+            details.Enabled = !refreshing && !writing && !exiting;
             LinkSwitch.Enabled = !refreshing && !exiting && Cards.Count > 1;
             foreach (var button in presets) button.Enabled = !refreshing && !exiting && Cards.Count > 0;
             foreach (var card in Cards) { card.Mode.Enabled = !writing && !refreshing && !exiting; card.SettingsButton.Enabled = card.Mode.Enabled; }
         }
         internal async Task RefreshDevices()
         {
-            if (writing) { refreshAgain = true; return; }
-            if (refreshing || exiting) return;
+            if (exiting) return;
+            if (writing || refreshing || settingsOpen) { refreshAgain = true; return; }
+            refreshAgain = false;
             refreshing = true; pending.Clear(); debounce.Stop(); UpdateButtons(); list.Enabled = false; Status = "正在检测显示器…"; Invalidate();
             await io.WaitAsync();
             try
@@ -273,6 +337,7 @@ namespace ScreenLight
             }
             catch (Exception ex) { Status = "检测失败：" + ex.Message; }
             finally { io.Release(); refreshing = false; if (!exiting) { list.Enabled = true; UpdateButtons(); Invalidate(); } }
+            if (refreshAgain && !exiting) { refreshAgain = false; await RefreshDevices(); return; }
             if (pending.Count > 0 && !exiting) { debounce.Start(); }
         }
         internal MonitorCard AttachDevice(MonitorDevice device)
@@ -297,7 +362,7 @@ namespace ScreenLight
         }
         internal void SetAll(int target)
         {
-            if (refreshing || exiting) return;
+            if (refreshing || exiting || settingsOpen) return;
             linkedUpdate = true;
             foreach (var card in Cards)
             {
@@ -323,7 +388,7 @@ namespace ScreenLight
         }
         internal async Task ApplyPending()
         {
-            if (writing || refreshing || exiting || pending.Count == 0) return;
+            if (writing || refreshing || exiting || topologyDebounce.Enabled || pending.Count == 0) return;
             int version = operationVersion;
             writing = true; UpdateButtons(); await io.WaitAsync();
             try
@@ -331,53 +396,58 @@ namespace ScreenLight
                 while (pending.Count > 0 && !exiting && version == operationVersion)
                 {
                     var batch = pending.ToArray(); pending.Clear();
-                    foreach (var item in batch)
+                    // Serialize physical targets on the same screen, but let independent screens
+                    // progress while another driver waits for its deadline.
+                    await Task.WhenAll(batch.GroupBy(item => item.Key.Device.ScreenName).Select(async group =>
                     {
-                        if (exiting || version != operationVersion) break;
-                        var card = item.Key; var device = card.Device;
-                        device.LastRequestedValue = item.Value;
-                        string fallback = null;
-                        if (!device.UsingSoftware)
+                        foreach (var item in group)
                         {
-                            card.State = "正在核对硬件亮度…"; card.Invalidate();
-                            try { await Task.Run(() => device.Set(device.Settings.Hardware(item.Value))); }
-                            catch (Exception ex) { fallback = ex.Message; }
-                        }
-                        if (exiting) break;
-                        if (version != operationVersion)
-                        {
-                            if (!device.UsingSoftware) device.Value = device.Settings.Logical(device.HardwareValue);
-                            card.Sync("软件调光已清除", "", false); Remember(device); break;
-                        }
-                        if (device.UsingSoftware || fallback != null)
-                        {
-                            try
+                            if (exiting || version != operationVersion) break;
+                            var card = item.Key; var device = card.Device;
+                            device.LastRequestedValue = item.Value;
+                            string fallback = null;
+                            if (!device.UsingSoftware)
                             {
-                                int target; if (!pending.TryGetValue(card, out target)) target = item.Value;
-                                target = Math.Max(10, target);
-                                device.LastRequestedValue = target;
-                                bool done = await dimming.ApplySmooth(device, target, preferences.Smooth, true, target,
-                                    () => exiting || version != operationVersion || (pending.ContainsKey(card) && pending[card] != target));
-                                if (done && !pending.ContainsKey(card)) { card.Sync(fallback != null ? "硬件未响应，已切换软件调光" : "软件调光已生效", fallback ?? "", false); Remember(device); }
+                                card.State = "正在核对硬件亮度…"; card.Invalidate();
+                                try { await Task.Run(() => device.Set(device.Settings.Hardware(item.Value))); }
+                                catch (Exception ex) { fallback = ex.Message; }
                             }
-                            catch (Exception ex) { card.Sync("调光失败：" + ex.Message, ex.ToString(), true); }
-                        }
-                        else
-                        {
-                            try
+                            if (exiting) break;
+                            if (version != operationVersion)
                             {
-                                int shade = device.Settings.Mode == ControlMode.混合 ? device.Settings.Software(item.Value) : 100;
-                                bool done = await dimming.ApplySmooth(device, shade, preferences.Smooth, false, item.Value,
-                                    () => exiting || version != operationVersion || pending.ContainsKey(card));
-                                if (done && !pending.ContainsKey(card))
+                                if (!device.UsingSoftware) device.Value = device.Settings.Logical(device.HardwareValue);
+                                card.Sync("软件调光已清除", "", false); Remember(device); break;
+                            }
+                            if (device.UsingSoftware || fallback != null)
+                            {
+                                try
                                 {
-                                    card.Sync(shade < 100 ? "混合调光已生效 · 背光已验证" : "硬件亮度已验证 · " + device.Value + "%", device.LastChannel, false);
-                                    Remember(device);
+                                    int target; if (!pending.TryGetValue(card, out target)) target = item.Value;
+                                    target = Math.Max(10, target);
+                                    device.LastRequestedValue = target;
+                                    bool done = await dimming.ApplySmooth(device, target, preferences.Smooth, true, target,
+                                        () => exiting || version != operationVersion || (pending.ContainsKey(card) && pending[card] != target));
+                                    if (done && !pending.ContainsKey(card)) { card.Sync(fallback != null ? "硬件未响应，已切换软件调光" : "软件调光已生效", fallback ?? "", false); Remember(device); }
                                 }
+                                catch (Exception ex) { card.Sync("调光失败：" + ex.Message, ex.ToString(), true); }
                             }
-                            catch (Exception ex) { card.Sync("调光失败：" + ex.Message, ex.ToString(), true); }
+                            else
+                            {
+                                try
+                                {
+                                    int shade = device.Settings.Mode == ControlMode.混合 ? device.Settings.Software(item.Value) : 100;
+                                    bool done = await dimming.ApplySmooth(device, shade, preferences.Smooth, false, item.Value,
+                                        () => exiting || version != operationVersion || pending.ContainsKey(card));
+                                    if (done && !pending.ContainsKey(card))
+                                    {
+                                        card.Sync(shade < 100 ? "混合调光已生效 · 背光已验证" : "硬件亮度已验证 · " + device.Value + "%", device.LastChannel, false);
+                                        Remember(device);
+                                    }
+                                }
+                                catch (Exception ex) { card.Sync("调光失败：" + ex.Message, ex.ToString(), true); }
+                            }
                         }
-                    }
+                    }));
                 }
             }
             finally
@@ -404,12 +474,18 @@ namespace ScreenLight
         {
             string text = (hotkeyStatus ?? "") + Environment.NewLine + (settingsStore.Error ?? "") + Environment.NewLine + string.Join(Environment.NewLine, service.Diagnostics);
             foreach (var device in service.Devices) text += Environment.NewLine + Environment.NewLine + device.Name + Environment.NewLine + string.Join(Environment.NewLine, device.Attempts);
-            using (var dialog = new DiagnosticsForm(Cards.ToArray(), text, UiScale)) { dialog.Icon = Icon; dialog.ShowDialog(this); }
+            using (var dialog = new DiagnosticsForm(Cards.ToArray(), text, UiScale)) { dialog.Icon = Icon; ShowOwnedDialog(dialog); }
         }
         internal async Task ExitAsync()
         {
             if (exiting) return;
-            exiting = true; debounce.Stop(); pending.Clear(); dimming.Dispose(); Hide(); tray.Visible = false;
+            exiting = true; debounce.Stop(); topologyDebounce.Stop(); pending.Clear(); dimming.Dispose(); Hide(); tray.Visible = false;
+            if (activeDialog != null)
+            {
+                activeDialog.Close();
+                // A display trial may need an asynchronous rollback before its dialog can close.
+                while (activeDialog != null && !activeDialog.IsDisposed) await Task.Delay(25);
+            }
             await io.WaitAsync();
             try { await Task.Run(() => service.Dispose()); }
             finally { io.Release(); allowClose = true; Close(); }
@@ -419,7 +495,7 @@ namespace ScreenLight
             if (disposing && !resourcesDisposed)
             {
                 resourcesDisposed = true;
-                dimming.Dispose(); if (debounce != null) debounce.Dispose();
+                dimming.Dispose(); if (debounce != null) debounce.Dispose(); if (topologyDebounce != null) topologyDebounce.Dispose();
                 if (IsHandleCreated) for (int id = 1; id <= 5; id++) UnregisterHotKey(Handle, id);
                 if (tray != null) { tray.Visible = false; tray.ContextMenuStrip.Dispose(); tray.Dispose(); }
                 if (appIcon != null) appIcon.Dispose();

@@ -124,11 +124,11 @@ namespace ScreenLight
             if (HasPhysicalHandle) { Native.DestroyPhysicalMonitor(Handle); HasPhysicalHandle = false; Handle = IntPtr.Zero; }
         }
     }
-    internal sealed class MonitorService : IDisposable
+    internal sealed class NativeMonitorService : IDisposable
     {
         internal readonly List<MonitorDevice> Devices = new List<MonitorDevice>();
         internal readonly List<string> Diagnostics = new List<string>();
-        internal void Discover()
+        internal void Discover(string screenName = null)
         {
             Dispose(); Diagnostics.Clear();
             var names = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -170,6 +170,8 @@ namespace ScreenLight
                 {
                     var info = new Native.MonitorInfo(); info.Size = Marshal.SizeOf(info);
                     if (!Native.GetMonitorInfo(monitor, ref info)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                    // Probe only this worker's logical screen; never touch another screen's DDC handle.
+                    if (screenName != null && !string.Equals(screenName, info.Device, StringComparison.OrdinalIgnoreCase)) return true;
                     var display = new Native.DisplayDevice(); display.Size = Marshal.SizeOf(display);
                     string id = Native.EnumDisplayDevices(info.Device, 0, ref display, 1) ? BrightnessMath.DisplayId(display.DeviceId) : "";
                     string friendly; names.TryGetValue(id, out friendly);
@@ -182,6 +184,7 @@ namespace ScreenLight
                         var device = new MonitorDevice { Instance = id, Error = "驱动未提供硬件亮度接口", UsingSoftware = true };
                         Describe(device, info, friendly ?? "显示器"); Devices.Add(device); return true;
                     }
+                    if (count > 32) throw new InvalidOperationException("驱动返回了异常的物理显示器数量");
                     var physical = new Native.PhysicalMonitor[count];
                     if (!Native.GetPhysicalMonitorsFromHMONITOR(monitor, count, physical)) throw new Win32Exception(Marshal.GetLastWin32Error());
                     for (int i = 0; i < physical.Length; i++)
