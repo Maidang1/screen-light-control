@@ -304,10 +304,74 @@ namespace ScreenLight
             var badSave = new DesktopTrial(() => { }, () => { throw new IOException("save failed"); }, () => now);
             token = badSave.Begin(); try { badSave.Confirm(token); } catch (IOException) { }
             Equal(true, badSave.Token != null, "persist failure keeps rollback armed");
+            NewCapabilityTests(state);
             bool xmlRejected = false;
             try { WireXml.Unpack<DesktopPlan>(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("<!DOCTYPE x [<!ENTITY e SYSTEM 'file:///nonexistent'>]><DesktopPlan>&e;</DesktopPlan>"))); }
             catch (InvalidOperationException) { xmlRejected = true; }
             Equal(true, xmlRejected, "profile parser prohibits external entities");
+        }
+        private static void NewCapabilityTests(DesktopState state)
+        {
+            // EDID identity: manufacturer "AOC", product 0x2703, serial string descriptor.
+            var edid = new byte[128]; new byte[] { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 }.CopyTo(edid, 0);
+            edid[8] = 0x05; edid[9] = 0xe3; edid[10] = 0x03; edid[11] = 0x27;
+            edid[57] = 0xff; System.Text.Encoding.ASCII.GetBytes("ABC123\n").CopyTo(edid, 59);
+            var info = EdidInfo.Parse(edid);
+            Equal("AOC", info.Manufacturer, "EDID manufacturer"); Equal("EDID:AOC2703:ABC123", info.StableKey, "EDID stable key");
+            edid[57] = 0; Equal(null, EdidInfo.Parse(edid).StableKey, "no serial means no stable identity");
+            var items = new System.Collections.Generic.List<string[]> { new[] { "EDID:X:1" }, new[] { "EDID:X:1" }, new[] { "EDID:Y:2" } };
+            MonitorIdentity.Disambiguate(items, i => i[0], (i, v) => i[0] = v);
+            Equal(null, items[0][0], "duplicated serials are not trusted"); Equal("EDID:Y:2", items[2][0], "unique serial kept");
+            // Settings follow the monitor across ports by EDID, but not a different monitor on the same port.
+            var prefs = new AppSettings();
+            using (var device = Device())
+            {
+                device.Instance = "DISPLAY\\AOC\\PORT1"; device.Identity = "EDID:AOC2703:ABC123";
+                var entry = prefs.For(device); entry.Minimum = 20;
+                device.Instance = "DISPLAY\\AOC\\PORT2"; Equal(entry, prefs.For(device), "profile follows monitor to another GPU port");
+                device.Identity = "EDID:AOC2703:OTHER"; Equal(false, prefs.For(device) == entry, "other monitor on same port gets its own profile");
+            }
+            // Plan import resolves a moved monitor by EDID.
+            var live = SampleDesktop(); live.Screens[1].Identity = "EDID:Z:9"; live.Screens[1].Id = "new-path";
+            var imported = new DesktopPlan { Screens = WireXml.Unpack<DesktopState>(WireXml.Pack(SampleDesktop())).Screens };
+            imported.Screens[1].Identity = "EDID:Z:9";
+            DisplayConsoleForm.Resolve(imported, live); Equal("new-path", imported.Screens[1].Id, "plan follows monitor by EDID");
+            // Target enable / disable validation.
+            var withTargets = SampleDesktop();
+            withTargets.Targets.Add(new DesktopTarget { Id = "stable-0", Active = true }); withTargets.Targets.Add(new DesktopTarget { Id = "off", Active = false });
+            new DesktopPlan { EnableTarget = "off" }.Validate(withTargets); Equal(true, true, "enable inactive output");
+            Action<DesktopPlan, string> rejectTarget = (value, name) => { bool failed = false; try { value.Validate(withTargets); } catch (InvalidDataException) { failed = true; } Equal(true, failed, name); };
+            rejectTarget(new DesktopPlan { DisableTarget = "stable-0" }, "cannot disable the last active output");
+            rejectTarget(new DesktopPlan { EnableTarget = "stable-0" }, "cannot enable active output");
+            rejectTarget(new DesktopPlan { EnableTarget = "off", Topology = 4 }, "target switch is standalone");
+            // Scale / SDR / WCG validation.
+            var edit = new DesktopPlan { Screens = WireXml.Unpack<DesktopState>(WireXml.Pack(state)).Screens };
+            edit.Screens[0].Scale = 150; bool rejected = false; try { edit.Validate(state); } catch (InvalidDataException) { rejected = true; }
+            Equal(true, rejected, "unsupported scale rejected");
+            edit = new DesktopPlan { Screens = WireXml.Unpack<DesktopState>(WireXml.Pack(state)).Screens };
+            edit.Screens[0].SdrWhiteLevel = 200; rejected = false; try { edit.Validate(state); } catch (InvalidDataException) { rejected = true; }
+            Equal(true, rejected, "SDR brightness requires HDR");
+            Equal("59.94 Hz", new DesktopScreen { RefreshNumerator = 60000, RefreshDenominator = 1001 }.ExactRefresh, "fractional refresh kept");
+            // Gamma ramps.
+            var identity = GammaMath.Identity(); Equal((ushort)0, identity[0], "identity black"); Equal((ushort)65535, identity[255], "identity white");
+            Equal(identity[128], identity[256 + 128], "identity is channel neutral");
+            var warm = GammaMath.Ramp(new ColorProfile { Temperature = 3000 });
+            Equal(true, warm[512 + 255] < warm[255], "warm temperature reduces blue");
+            // DDC capability parsing.
+            var listed = MonitorHardware.Listed("(prot(monitor)vcp(02 04 05 08 10 12 14(05 08 0B) 60(0F 11) d6(01 04)))");
+            Equal(true, listed.Contains(0x04) && listed.Contains(0x14) && listed.Contains(0xd6), "VCP codes listed");
+            Equal(false, listed.Contains(0x0b), "nested values are not codes");
+            Equal(3, MonitorHardware.Values("vcp(14(05 08 0B))", 0x14).Count, "discrete values parsed");
+            // Night light blob (known layout) toggles symmetrically.
+            var blob = new byte[] { 0x43, 0x42, 1, 0, 0x0a, 2, 1, 0, 0x2a, 6, 1, 2, 3, 4, 5, 0x2a, 0x2b, 0x0e, 0x13, 0x43, 0x42, 1, 0, 0xc2, 0x0a, 0, 0xca, 0x14, 0x0e, 0x15, 0, 0xca, 0x1e, 0x0e, 7, 0, 0xcf, 0x28, 0, 0, 0, 0, 0, 0 };
+            Equal(false, NightLight.Parse(blob), "night light off");
+            var on = NightLight.Toggle(blob, true); Equal(true, NightLight.Parse(on), "night light on"); Equal(blob.Length + 2, on.Length, "enabled flag inserted");
+            Equal(false, NightLight.Parse(NightLight.Toggle(on, false)), "night light off again");
+            rejected = false; try { NightLight.Toggle(new byte[40], true); } catch (InvalidOperationException) { rejected = true; }
+            Equal(true, rejected, "unknown night light layout is never modified");
+            Equal(2, GpuPreferences.ParsePreference("SwapEffectUpgradeEnable=1;GpuPreference=2;"), "GPU preference parsed");
+            Equal("GpuPreference=1;SwapEffectUpgradeEnable=1;", GpuPreferences.Merge("GpuPreference=2;SwapEffectUpgradeEnable=1;", 1), "other DirectX options preserved");
+            Equal(25, ColorFilters.Matrix(3).Length, "color filter matrix size");
         }
         private static void ConsoleUiTest(string output)
         {
@@ -319,7 +383,7 @@ namespace ScreenLight
                     using (var graphics = Graphics.FromImage(bitmap)) graphics.CopyFromScreen(form.Location, Point.Empty, form.Size);
                     bitmap.Save(Path.Combine(output, "screen-light-console.png"));
                 }
-                Equal(true, form.Controls.OfType<TabControl>().Single().TabPages.Count == 4, "display console exposes all capability groups");
+                Equal(true, form.Controls.OfType<TabControl>().Single().TabPages.Count == 7, "display console exposes all capability groups");
                 form.Close();
                 for (int i = 0; i < 100 && !form.IsDisposed; i++) { Application.DoEvents(); System.Threading.Thread.Sleep(5); }
                 Equal(true, form.IsDisposed, "console can close without touching display hardware");

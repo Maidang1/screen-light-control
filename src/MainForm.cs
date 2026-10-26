@@ -15,6 +15,8 @@ namespace ScreenLight
     {
         private readonly MonitorService service = new MonitorService();
         private readonly DimmingManager dimming = new DimmingManager();
+        private readonly ColorManager colors;
+        private readonly System.Windows.Forms.Timer colorTimer;
         private readonly SemaphoreSlim io = new SemaphoreSlim(1, 1);
         private readonly Dictionary<MonitorCard, int> pending = new Dictionary<MonitorCard, int>();
         internal readonly List<MonitorCard> Cards = new List<MonitorCard>();
@@ -47,6 +49,7 @@ namespace ScreenLight
             testing = testMode; startHidden = startInTray;
             settingsStore = new SettingsStore(testMode ? null : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.xml"));
             preferences = settingsStore.Load();
+            if (!testMode) colors = new ColorManager(() => preferences);
             Text = "屏幕亮度 · Screen Light"; BackColor = Theme.Background; ForeColor = Theme.Text; AutoScaleMode = AutoScaleMode.None;
             using (var graphics = CreateGraphics()) UiScale = graphics.DpiX / 96f;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -81,7 +84,8 @@ namespace ScreenLight
             }
             menu.Items.Add(brightnessMenu);
             menu.Items.Add("重新检测显示器", null, async delegate { await RefreshDevices(); });
-            menu.Items.Add("恢复画面（清除软件调光）", null, delegate { ResetDimming(); }); menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("恢复画面（清除软件调光）", null, delegate { ResetDimming(); });
+            menu.Items.Add("关闭所有显示器", null, delegate { MonitorPower.Off(this); }); menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出", null, async delegate { await ExitAsync(); });
             tray = new NotifyIcon { Icon = appIcon, Text = "Screen Light · 显示控制", ContextMenuStrip = menu, Visible = !testMode };
             tray.MouseClick += delegate(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Restore(); };
@@ -89,13 +93,17 @@ namespace ScreenLight
             debounce.Tick += async delegate { debounce.Stop(); await ApplyPending(); };
             topologyDebounce = new System.Windows.Forms.Timer { Interval = 200 };
             topologyDebounce.Tick += async delegate { topologyDebounce.Stop(); await RefreshDevices(); };
+            // Gamma ramps are lost on mode changes, driver resets and when other tools write them.
+            colorTimer = new System.Windows.Forms.Timer { Interval = 3000 };
+            colorTimer.Tick += delegate { if (colors != null && colors.Active && !exiting) colors.Reassert(); };
+            if (colors != null) colorTimer.Start();
             Shown += async delegate { await InitializeAsync(discoverOnShow); };
             Resize += delegate { LayoutUi(); if (WindowState == FormWindowState.Minimized) HideToTray(); };
             FormClosing += async delegate(object sender, FormClosingEventArgs e)
             {
                 if (allowClose) return;
                 if (e.CloseReason == CloseReason.WindowsShutDown || e.CloseReason == CloseReason.TaskManagerClosing)
-                { exiting = true; pending.Clear(); debounce.Stop(); topologyDebounce.Stop(); dimming.Dispose(); tray.Visible = false; allowClose = true; return; }
+                { exiting = true; pending.Clear(); debounce.Stop(); topologyDebounce.Stop(); dimming.Dispose(); if (colors != null) colors.Dispose(); tray.Visible = false; allowClose = true; return; }
                 e.Cancel = true;
                 if (testMode) await ExitAsync(); else HideToTray();
             };
@@ -226,7 +234,7 @@ namespace ScreenLight
             try
             {
                 await Task.Run(() => service.Dispose());
-                if (!exiting) using (var dialog = new DisplayConsoleForm()) { dialog.Icon = Icon; ShowOwnedDialog(dialog); }
+                if (!exiting) using (var dialog = new DisplayConsoleForm(true, preferences, SaveSettings, colors)) { dialog.Icon = Icon; ShowOwnedDialog(dialog); }
             }
             finally { settingsOpen = false; }
             if (!exiting) await RefreshDevices();
@@ -303,7 +311,7 @@ namespace ScreenLight
             await io.WaitAsync();
             try
             {
-                var previous = Cards.ToDictionary(c => c.Device.Settings.Id, c => new int[] { c.Device.Value, c.Device.UsingSoftware ? 1 : 0 });
+                var previous = Cards.GroupBy(c => c.Device.Settings.Id).ToDictionary(g => g.Key, g => new int[] { g.First().Device.Value, g.First().Device.UsingSoftware ? 1 : 0 });
                 await Task.Run(() => service.Discover()); if (exiting) return;
                 foreach (var card in Cards) card.Dispose(); Cards.Clear();
                 dimming.Reconcile(service.Devices);
@@ -334,6 +342,7 @@ namespace ScreenLight
                 }
                 LayoutUi();
                 firstDiscovery = false;
+                if (colors != null) colors.ApplyAll();
             }
             catch (Exception ex) { Status = "检测失败：" + ex.Message; }
             finally { io.Release(); refreshing = false; if (!exiting) { list.Enabled = true; UpdateButtons(); Invalidate(); } }
@@ -473,13 +482,14 @@ namespace ScreenLight
         private void ShowDiagnostics()
         {
             string text = (hotkeyStatus ?? "") + Environment.NewLine + (settingsStore.Error ?? "") + Environment.NewLine + string.Join(Environment.NewLine, service.Diagnostics);
+            if (colors != null && colors.Messages.Count > 0) text += Environment.NewLine + string.Join(Environment.NewLine, colors.Messages);
             foreach (var device in service.Devices) text += Environment.NewLine + Environment.NewLine + device.Name + Environment.NewLine + string.Join(Environment.NewLine, device.Attempts);
             using (var dialog = new DiagnosticsForm(Cards.ToArray(), text, UiScale)) { dialog.Icon = Icon; ShowOwnedDialog(dialog); }
         }
         internal async Task ExitAsync()
         {
             if (exiting) return;
-            exiting = true; debounce.Stop(); topologyDebounce.Stop(); pending.Clear(); dimming.Dispose(); Hide(); tray.Visible = false;
+            exiting = true; debounce.Stop(); topologyDebounce.Stop(); colorTimer.Stop(); pending.Clear(); dimming.Dispose(); if (colors != null) colors.Dispose(); Hide(); tray.Visible = false;
             if (activeDialog != null)
             {
                 activeDialog.Close();
@@ -496,6 +506,7 @@ namespace ScreenLight
             {
                 resourcesDisposed = true;
                 dimming.Dispose(); if (debounce != null) debounce.Dispose(); if (topologyDebounce != null) topologyDebounce.Dispose();
+                if (colorTimer != null) colorTimer.Dispose(); if (colors != null) colors.Dispose();
                 if (IsHandleCreated) for (int id = 1; id <= 5; id++) UnregisterHotKey(Handle, id);
                 if (tray != null) { tray.Visible = false; tray.ContextMenuStrip.Dispose(); tray.Dispose(); }
                 if (appIcon != null) appIcon.Dispose();

@@ -80,7 +80,7 @@ namespace ScreenLight
     }
     internal sealed class MonitorDevice : IDisposable
     {
-        internal string Name, ScreenName, Instance, Error, LastChannel;
+        internal string Name, ScreenName, Instance, Identity, Error, LastChannel;
         internal Rectangle Bounds;
         internal bool Primary, UsingSoftware;
         internal DisplaySettings Settings = new DisplaySettings();
@@ -142,7 +142,7 @@ namespace ScreenLight
                         var bytes = item["UserFriendlyName"] as ushort[];
                         string name = bytes == null ? "" : new string(bytes.Where(b => b != 0).Select(b => (char)b).ToArray());
                         string id = BrightnessMath.DisplayId(Convert.ToString(item["InstanceName"]));
-                        if (name.Length > 0) names[id] = (id.StartsWith(@"DISPLAY\AOC") ? "AOC " : "") + name;
+                        if (name.Length > 0) names[id] = name;
                     }
             }
             catch (Exception ex) { Diagnostics.Add("显示器名称：" + ex.Message); }
@@ -172,26 +172,37 @@ namespace ScreenLight
                     if (!Native.GetMonitorInfo(monitor, ref info)) throw new Win32Exception(Marshal.GetLastWin32Error());
                     // Probe only this worker's logical screen; never touch another screen's DDC handle.
                     if (screenName != null && !string.Equals(screenName, info.Device, StringComparison.OrdinalIgnoreCase)) return true;
-                    var display = new Native.DisplayDevice(); display.Size = Marshal.SizeOf(display);
-                    string id = Native.EnumDisplayDevices(info.Device, 0, ref display, 1) ? BrightnessMath.DisplayId(display.DeviceId) : "";
-                    string friendly; names.TryGetValue(id, out friendly);
+                    // A cloned HMONITOR carries several monitors; map each one by its own device path.
+                    var paths = MonitorIdentity.MonitorPaths(info.Device);
+                    Func<string, string> nameOf = path => { string value; return path != null && names.TryGetValue(BrightnessMath.DisplayId(path), out value) ? value : null; };
                     MonitorDevice internalDevice;
-                    if (wmiDevices.TryGetValue(id, out internalDevice))
-                    { Describe(internalDevice, info, friendly ?? "内置屏幕"); Devices.Add(internalDevice); return true; }
+                    var external = new List<string>();
+                    foreach (string path in paths)
+                    {
+                        if (wmiDevices.TryGetValue(BrightnessMath.DisplayId(path), out internalDevice))
+                        { Describe(internalDevice, info, nameOf(path) ?? "内置屏幕"); internalDevice.Identity = MonitorIdentity.Key(path); Devices.Add(internalDevice); }
+                        else external.Add(path);
+                    }
+                    if (paths.Count > 0 && external.Count == 0) return true;
+                    string id = external.Count > 0 ? BrightnessMath.DisplayId(external[0]) : "";
                     uint count;
                     if (!Native.GetNumberOfPhysicalMonitorsFromHMONITOR(monitor, out count) || count == 0)
                     {
-                        var device = new MonitorDevice { Instance = id, Error = "驱动未提供硬件亮度接口", UsingSoftware = true };
-                        Describe(device, info, friendly ?? "显示器"); Devices.Add(device); return true;
+                        var device = new MonitorDevice { Instance = id, Identity = MonitorIdentity.Key(external.FirstOrDefault()), Error = "驱动未提供硬件亮度接口", UsingSoftware = true };
+                        Describe(device, info, nameOf(external.FirstOrDefault()) ?? "显示器"); Devices.Add(device); return true;
                     }
                     if (count > 32) throw new InvalidOperationException("驱动返回了异常的物理显示器数量");
                     var physical = new Native.PhysicalMonitor[count];
                     if (!Native.GetPhysicalMonitorsFromHMONITOR(monitor, count, physical)) throw new Win32Exception(Marshal.GetLastWin32Error());
                     for (int i = 0; i < physical.Length; i++)
                     {
-                        var device = new MonitorDevice { Instance = (string.IsNullOrEmpty(id) ? info.Device : id) + "|physical:" + i, Handle = physical[i].Handle, HasPhysicalHandle = true };
+                        // Physical monitors follow the driver's monitor order; internal panels already use WMI.
+                        string path = physical.Length == paths.Count ? paths[i] : physical.Length == external.Count ? external[i] : physical.Length == 1 ? external.FirstOrDefault() : null;
+                        if (path != null && !external.Contains(path)) { Native.DestroyPhysicalMonitor(physical[i].Handle); continue; }
+                        string own = path == null ? id : BrightnessMath.DisplayId(path);
+                        var device = new MonitorDevice { Instance = (string.IsNullOrEmpty(own) ? info.Device : own) + "|physical:" + i, Identity = MonitorIdentity.Key(path), Handle = physical[i].Handle, HasPhysicalHandle = true };
                         Devices.Add(device);
-                        Describe(device, info, friendly ?? (physical[i].Description == "Generic PnP Monitor" ? "外接显示器" : physical[i].Description));
+                        Describe(device, info, nameOf(path) ?? (physical[i].Description == "Generic PnP Monitor" ? "外接显示器" : physical[i].Description));
                         foreach (bool vcp in new bool[] { true, false })
                         {
                             var channel = new PhysicalChannel(device.Handle, vcp);
@@ -204,6 +215,7 @@ namespace ScreenLight
                         }
                         if (!device.Supported) { device.UsingSoftware = true; device.Error = "未检测到可用的硬件亮度接口"; }
                     }
+                    return true;
                 }
                 catch (Exception ex) { Diagnostics.Add("显示器检测：" + ex.Message); }
                 return true;
@@ -211,6 +223,7 @@ namespace ScreenLight
             if (!Native.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, callback, IntPtr.Zero)) Diagnostics.Add("Windows 显示器枚举失败");
             GC.KeepAlive(callback);
             foreach (var device in wmiDevices.Values) if (!Devices.Contains(device)) device.Dispose();
+            MonitorIdentity.Disambiguate(Devices, d => d.Identity, (d, v) => d.Identity = v);
         }
         private static void Describe(MonitorDevice device, Native.MonitorInfo info, string name)
         {
