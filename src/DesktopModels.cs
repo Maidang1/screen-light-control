@@ -15,23 +15,68 @@ namespace ScreenLight
     }
     public sealed class DesktopScreen
     {
-        public string Id, Name, Device;
+        public string Id, Name, Device, Identity, Adapter, AdapterId, Connector;
         public int Width, Height, Frequency, X, Y, Rotation;
-        public bool Primary, HdrSupported, HdrEnabled;
+        // Exact path timing (59.94 Hz is 60000/1001); Frequency follows the integer DEVMODE convention.
+        public int RefreshNumerator, RefreshDenominator, NativeWidth, NativeHeight, BitsPerColor, ColorEncoding;
+        public bool Primary, HdrSupported, HdrEnabled, WcgSupported, WcgEnabled;
+        // SDR content brightness in HDR mode (nits, 80-480); 0 when unknown.
+        public int SdrWhiteLevel;
+        // Per-monitor DPI scaling in percent; empty options when the driver does not report them.
+        public int Scale, ScaleRecommended;
+        public List<int> ScaleOptions = new List<int>();
         public List<DesktopMode> Modes = new List<DesktopMode>();
-        public override string ToString() { return Name + (Primary ? " · 主屏" : "") + " · " + Device; }
+        internal string ExactRefresh
+        {
+            get
+            {
+                if (RefreshDenominator <= 0 || RefreshNumerator <= 0) return Frequency + " Hz";
+                return (RefreshNumerator / (double)RefreshDenominator).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + " Hz";
+            }
+        }
+        internal static string EncodingName(int value)
+        {
+            return value == 0 ? "RGB" : value == 1 ? "YCbCr 4:4:4" : value == 2 ? "YCbCr 4:2:2" : value == 3 ? "YCbCr 4:2:0" : value == 4 ? "Intensity" : "未知";
+        }
+        public override string ToString() { return Name + (Primary ? " · 主屏" : "") + " · " + Device + (string.IsNullOrEmpty(Adapter) ? "" : " · " + Adapter); }
+    }
+    // Every connected monitor output, including outputs Windows currently does not drive.
+    public sealed class DesktopTarget
+    {
+        public string Id, Name, Identity, Adapter, AdapterId, Connector, Device;
+        public bool Active;
+        public override string ToString() { return (Active ? "● " : "○ ") + Name + " · " + Connector + " · " + Adapter + (Active ? " · " + Device : " · 未启用"); }
+    }
+    public sealed class DesktopAdapter
+    {
+        public string Id, Name, Vendor, Path;
+        public override string ToString() { return Name + " · " + Vendor + " · LUID " + Id; }
     }
     public sealed class DesktopState
     {
         public List<DesktopScreen> Screens = new List<DesktopScreen>();
+        public List<DesktopTarget> Targets = new List<DesktopTarget>();
+        public List<DesktopAdapter> Adapters = new List<DesktopAdapter>();
     }
     public sealed class DesktopPlan
     {
         // 0 = explicit screen modes, 1/2/4/8 = internal/clone/extend/external.
         public int Topology;
+        // Enabling or disabling a single output is a standalone operation like a projection switch.
+        public string EnableTarget, DisableTarget;
         public List<DesktopScreen> Screens = new List<DesktopScreen>();
         internal void Validate(DesktopState state)
         {
+            if (EnableTarget != null || DisableTarget != null)
+            {
+                if (Topology != 0 || Screens.Count != 0 || (EnableTarget != null && DisableTarget != null)) throw new InvalidDataException("启用或停用显示器不能与其他配置混合提交");
+                var target = state.Targets.FirstOrDefault(t => t.Id == (EnableTarget ?? DisableTarget));
+                if (target == null) throw new InvalidDataException("显示器输出已断开");
+                if (EnableTarget != null && target.Active) throw new InvalidDataException("该显示器已经启用");
+                if (DisableTarget != null && !target.Active) throw new InvalidDataException("该显示器尚未启用");
+                if (DisableTarget != null && state.Targets.Count(t => t.Active) < 2) throw new InvalidDataException("至少需要保留一块启用的显示器");
+                return;
+            }
             if (Topology != 0)
             {
                 if (!new[] { 1, 2, 4, 8 }.Contains(Topology) || Screens.Count != 0) throw new InvalidDataException("投影模式不能与逐屏配置混合提交");
@@ -51,6 +96,10 @@ namespace ScreenLight
                 if (!current.Modes.Any(m => m.Width == (rotated ? screen.Height : screen.Width) && m.Height == (rotated ? screen.Width : screen.Height) && m.Frequency == screen.Frequency))
                     throw new InvalidDataException(current.Name + " 不支持所选分辨率与刷新率");
                 if (!current.HdrSupported && screen.HdrEnabled != current.HdrEnabled) throw new InvalidDataException("当前屏幕未开放 HDR 控制");
+                if (!current.WcgSupported && screen.WcgEnabled != current.WcgEnabled) throw new InvalidDataException("当前屏幕未开放广色域控制");
+                if (screen.Scale != current.Scale && !current.ScaleOptions.Contains(screen.Scale)) throw new InvalidDataException(current.Name + " 不支持所选缩放比例");
+                if (screen.SdrWhiteLevel != current.SdrWhiteLevel && (!screen.HdrEnabled || screen.SdrWhiteLevel < 80 || screen.SdrWhiteLevel > 480))
+                    throw new InvalidDataException("SDR 内容亮度只能在 HDR 开启时设置为 80–480 尼特");
             }
             for (int i = 0; i < Screens.Count; i++) for (int j = i + 1; j < Screens.Count; j++)
             {
@@ -77,6 +126,7 @@ namespace ScreenLight
     {
         public int Code, Minimum, Maximum, Current;
         public string Name;
+        public bool Action;
         public List<int> Values = new List<int>();
         public override string ToString() { return Name; }
     }

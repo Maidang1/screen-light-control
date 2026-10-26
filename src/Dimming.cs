@@ -29,6 +29,9 @@ namespace ScreenLight
         {
             if (message.Msg == 0x0084) { message.Result = new IntPtr(-1); return; } // HTTRANSPARENT
             if (message.Msg == 0x0021) { message.Result = new IntPtr(3); return; } // MA_NOACTIVATE
+            // The layer is sized in physical pixels for its own monitor. Crossing a monitor with a
+            // different DPI must not let WinForms rescale it (WM_DPICHANGED / WM_GETDPISCALEDSIZE).
+            if (message.Msg == 0x02E0 || message.Msg == 0x02E4) { message.Result = IntPtr.Zero; return; }
             if ((message.Msg == 0x0006 && (message.WParam.ToInt64() & 0xffff) != 0) || message.Msg == 0x0007)
             {
                 // Some desktop hooks activate newly created top-level windows explicitly.

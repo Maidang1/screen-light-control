@@ -22,6 +22,8 @@ namespace ScreenLight
     public sealed class DisplaySettings
     {
         [Browsable(false)] public string Id { get; set; }
+        // EDID manufacturer/product/serial; survives moving the cable to another port or GPU.
+        [Browsable(false)] public string Identity { get; set; }
         [DisplayName("显示器名称")] public string Name { get; set; }
         [DisplayName("调光模式"), Description("混合模式：滑块低于 20% 时，在最低硬件背光上继续软件调暗。")] public ControlMode Mode { get; set; }
         [DisplayName("最低硬件亮度 (%)")] public int Minimum { get; set; }
@@ -53,6 +55,27 @@ namespace ScreenLight
         internal int Software(int logical) { return Mode == ControlMode.混合 ? Math.Max(10, Math.Min(100, logical * 5)) : Math.Max(10, BrightnessMath.Clamp(logical)); }
     }
 
+    // Per-monitor gamma-ramp color adjustment, keyed by MonitorIdentity.Key.
+    public sealed class ColorProfile
+    {
+        public string Key { get; set; }
+        public bool Enabled { get; set; }
+        public int Temperature { get; set; }
+        public double Gamma { get; set; }
+        public int Brightness { get; set; }
+        public int Red { get; set; }
+        public int Green { get; set; }
+        public int Blue { get; set; }
+        public ColorProfile() { Temperature = 6500; Gamma = 1; Brightness = 100; Red = Green = Blue = 100; }
+        internal bool IsNeutral { get { return Temperature == 6500 && Math.Abs(Gamma - 1) < .001 && Brightness == 100 && Red == 100 && Green == 100 && Blue == 100; } }
+        internal void Validate()
+        {
+            if (Temperature < 1200 || Temperature > 10000 || double.IsNaN(Gamma) || Gamma < .3 || Gamma > 3 || Brightness < 10 || Brightness > 100
+                || Red < 0 || Red > 100 || Green < 0 || Green > 100 || Blue < 0 || Blue > 100)
+                throw new InvalidDataException("颜色设置需满足：色温 1200–10000K，伽马 0.3–3.0，亮度 10–100%，RGB 增益 0–100%。");
+        }
+    }
+
     public sealed class AppSettings
     {
         [TypeConverter(typeof(ChineseBooleanConverter)), DisplayName("启用全局快捷键"), Description("Ctrl+Alt+↑/↓ 调节 5%；加 Shift 调节 1%；Ctrl+Alt+Home 恢复软件调光。")] public bool Hotkeys { get; set; }
@@ -61,12 +84,29 @@ namespace ScreenLight
         [TypeConverter(typeof(ChineseBooleanConverter)), DisplayName("平滑软件调光")] public bool Smooth { get; set; }
         [TypeConverter(typeof(ChineseBooleanConverter)), DisplayName("启动时恢复上次亮度"), Description("默认关闭。开启后，启动时会主动调节屏幕亮度。")] public bool Restore { get; set; }
         [Browsable(false)] public List<DisplaySettings> Displays { get; set; }
-        public AppSettings() { Hotkeys = true; Smooth = true; Displays = new List<DisplaySettings>(); }
+        [Browsable(false)] public List<ColorProfile> Colors { get; set; }
+        // 0 = off; otherwise a ColorFilters preset applied through the Magnification API.
+        [Browsable(false)] public int ColorFilter { get; set; }
+        public AppSettings() { Hotkeys = true; Smooth = true; Displays = new List<DisplaySettings>(); Colors = new List<ColorProfile>(); }
+        internal ColorProfile ColorFor(string identity, bool create)
+        {
+            var entry = Colors.FirstOrDefault(c => c.Key == identity);
+            if (entry == null && create && identity != null) { entry = new ColorProfile { Key = identity }; Colors.Add(entry); }
+            return entry;
+        }
         internal DisplaySettings For(MonitorDevice device)
         {
             string id = string.IsNullOrEmpty(device.Instance) ? device.ScreenName + "|" + device.Name : device.Instance;
-            var entry = Displays.FirstOrDefault(p => p.Id == id);
+            string identity = device.Identity != null && device.Identity.StartsWith("EDID:") ? device.Identity : null;
+            DisplaySettings entry = identity == null ? null : Displays.FirstOrDefault(p => p.Identity == identity);
+            if (entry == null)
+            {
+                entry = Displays.FirstOrDefault(p => p.Id == id);
+                // The same port now hosts a different monitor: do not inherit its calibration.
+                if (entry != null && identity != null && entry.Identity != null && entry.Identity != identity) entry = null;
+            }
             if (entry == null) { entry = new DisplaySettings { Id = id }; Displays.Add(entry); }
+            if (identity != null) { entry.Identity = identity; entry.Id = id; }
             return entry;
         }
         internal void Validate()
@@ -74,6 +114,9 @@ namespace ScreenLight
             if (!Enum.IsDefined(typeof(HotkeyTarget), Target)) throw new InvalidDataException("快捷键范围无效。");
             if (Displays == null) Displays = new List<DisplaySettings>();
             foreach (var entry in Displays) { if (entry == null) throw new InvalidDataException("显示器设置无效。"); entry.Validate(); }
+            if (Colors == null) Colors = new List<ColorProfile>();
+            foreach (var entry in Colors) { if (entry == null || string.IsNullOrEmpty(entry.Key)) throw new InvalidDataException("颜色设置无效。"); entry.Validate(); }
+            if (ColorFilter < 0 || ColorFilter >= ColorFilters.Names.Length) throw new InvalidDataException("颜色滤镜无效。");
         }
     }
 

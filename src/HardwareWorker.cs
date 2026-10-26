@@ -149,6 +149,7 @@ namespace ScreenLight
                         device.Bounds = new Rectangle(reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt32());
                         device.Primary = reader.ReadBoolean(); device.Value = device.HardwareValue = reader.ReadInt32();
                         device.Error = reader.ReadString(); device.UsingSoftware = reader.ReadBoolean();
+                        device.Identity = reader.ReadString(); if (device.Identity.Length == 0) device.Identity = null;
                         int channels = reader.ReadInt32();
                         for (int c = 0; c < channels; c++) device.Channels.Add(new RemoteChannel(result.Connection, i, c, reader.ReadString()));
                     }
@@ -205,8 +206,9 @@ namespace ScreenLight
                                 string[] parts = command.Split(' ');
                                 string reply;
                                 if (parts[0].StartsWith("DESKTOP_")) reply = desktop.Request(parts[0], parts.Length > 1 ? parts[1] : "");
-                                else if (parts[0] == "FEATURE_PROBE") reply = WireXml.Pack(MonitorHardware.Probe(Encoding.UTF8.GetString(Convert.FromBase64String(parts[1]))));
-                                else if (parts[0] == "FEATURE_WRITE") reply = Convert.ToBase64String(Encoding.UTF8.GetBytes(MonitorHardware.Write(Encoding.UTF8.GetString(Convert.FromBase64String(parts[1])), int.Parse(parts[2]), int.Parse(parts[3]))));
+                                else if (parts[0] == "FEATURE_PROBE") reply = WireXml.Pack(MonitorHardware.Probe(Decode(parts, 1), Decode(parts, 2)));
+                                else if (parts[0] == "FEATURE_WRITE") reply = Convert.ToBase64String(Encoding.UTF8.GetBytes(MonitorHardware.Write(Decode(parts, 1), Decode(parts, 4), int.Parse(parts[2]), int.Parse(parts[3]))));
+                                else if (parts[0] == "DISPLAY_EXTRA") reply = WireXml.Pack(DisplayExtras.Execute(WireXml.Unpack<DisplayCommand>(parts[1])));
                                 else if (parts[0] == "DISCOVER")
                                 {
                                     if (parts.Length != 2) throw new InvalidOperationException("Missing display target");
@@ -229,6 +231,12 @@ namespace ScreenLight
             }
             return true;
         }
+        // Optional base64 UTF-8 argument; absent or "-" means null.
+        private static string Decode(string[] parts, int index)
+        {
+            return parts.Length <= index || parts[index] == "-" ? null : Encoding.UTF8.GetString(Convert.FromBase64String(parts[index]));
+        }
+        internal static string Encode(string value) { return value == null ? "-" : Convert.ToBase64String(Encoding.UTF8.GetBytes(value)); }
         internal static string Snapshot(NativeMonitorService service)
         {
             using (var stream = new MemoryStream())
@@ -240,7 +248,7 @@ namespace ScreenLight
                     {
                         writer.Write(device.Name ?? ""); writer.Write(device.ScreenName ?? ""); writer.Write(device.Instance ?? "");
                         writer.Write(device.Bounds.X); writer.Write(device.Bounds.Y); writer.Write(device.Bounds.Width); writer.Write(device.Bounds.Height);
-                        writer.Write(device.Primary); writer.Write(device.Value); writer.Write(device.Error ?? ""); writer.Write(device.UsingSoftware);
+                        writer.Write(device.Primary); writer.Write(device.Value); writer.Write(device.Error ?? ""); writer.Write(device.UsingSoftware); writer.Write(device.Identity ?? "");
                         writer.Write(device.Channels.Count); foreach (var channel in device.Channels) writer.Write(channel.Name);
                     }
                     writer.Write(service.Diagnostics.Count); foreach (var message in service.Diagnostics) writer.Write(message);
